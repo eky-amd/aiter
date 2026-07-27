@@ -10,6 +10,11 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle,
 )
+from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale_streamk import (
+    gemm_a8w8_streamk_pure,
+    gemm_a8w8_streamk_dp_1tile,
+    gemm_a8w8_streamk_dp_2tile,
+)
 from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale as gluon_gfx950_gemm_a8w8_blockscale,
 )
@@ -147,7 +152,8 @@ def generate_gemm_a8w8_blockscale_inputs(
 )
 @pytest.mark.parametrize("backend", ["gluon", "triton"])
 @pytest.mark.parametrize("shuffle", [True, False])
-def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
+@pytest.mark.parametrize("streamk", ["none", "pure", "dp_1tile", "dp_2tile"])
+def test_gemm(dtype, M, N, K, layout, output, backend, shuffle, streamk):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.cuda.synchronize()
 
@@ -185,7 +191,7 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
-    if not shuffle and backend == "gluon" and DEVICE_ARCH == "gfx950":
+    if not shuffle and streamk == "none" and backend == "gluon" and DEVICE_ARCH == "gfx950":
         impl = gluon_gfx950_gemm_a8w8_blockscale
     else:
         if shuffle:
@@ -195,10 +201,25 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
                     x, w, xs, ws, dt, y, backend=backend
                 )
 
-        else:
+        elif streamk == "none":
 
             def impl(x, w, xs, ws, dt, y):
                 return gemm_a8w8_blockscale(x, w, xs, ws, dt, y, backend=backend)
+            
+        elif streamk == "pure":
+        
+                    def impl(x, w, xs, ws, dt, y):
+                        return gemm_a8w8_streamk_pure(x, w, xs, ws, dt, y, backend=backend)
+                    
+        elif streamk == "dp_1tile":
+        
+                    def impl(x, w, xs, ws, dt, y):
+                        return gemm_a8w8_streamk_dp_1tile(x, w, xs, ws, dt, y, backend=backend)
+                    
+        elif streamk == "dp_2tile":
+        
+                    def impl(x, w, xs, ws, dt, y):
+                        return gemm_a8w8_streamk_dp_2tile(x, w, xs, ws, dt, y, backend=backend)
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
