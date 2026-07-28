@@ -88,29 +88,24 @@ def _streamk_mac_range(
     BLOCK_SIZE_M: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
     BLOCK_SIZE_K: gl.constexpr,
-    wmma_layout: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    OPERAND_LAYOUT_A: gl.constexpr,
+    OPERAND_LAYOUT_B: gl.constexpr,
     warp_bases: gl.constexpr,
     SCALAR_B_SCALE: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
 ):
-    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=wmma_layout, k_width=8
-    )
-    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=wmma_layout, k_width=8
-    )
-
-    acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_layout)
-    zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=wmma_layout)
+    acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+    zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=WMMA_LAYOUT)
 
     offs_am = (
         pid_m * BLOCK_SIZE_M
-        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout))
+        + gl.arange(0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, WMMA_LAYOUT))
     ) % M
     offs_bn = (
         pid_n * BLOCK_SIZE_N
-        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout))
+        + gl.arange(0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, WMMA_LAYOUT))
     ) % N
     offs_a_scale = offs_am * stride_ascale_m
     
@@ -143,11 +138,11 @@ def _streamk_mac_range(
 
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
 
-    cur_a = tdm_smem_a.index(num_computes % NUM_BUFFERS).load(layout=dot_a_layout)
+    cur_a = tdm_smem_a.index(num_computes % NUM_BUFFERS).load(layout=OPERAND_LAYOUT_A)
     cur_b = (
         tdm_smem_b.index(num_computes % NUM_BUFFERS)
         .permute((1, 0))
-        .load(layout=dot_b_layout)
+        .load(layout=OPERAND_LAYOUT_B)
     )
         
     # -------------------- Main loop -----------------------------------------
@@ -190,12 +185,12 @@ def _streamk_mac_range(
         num_loads += 1
 
         cur_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
-            layout=dot_a_layout
+            layout=OPERAND_LAYOUT_A
         )
         cur_b = (
             tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS)
             .permute((1, 0))
-            .load(layout=dot_b_layout)
+            .load(layout=OPERAND_LAYOUT_B)
         )
         num_computes += 1
 
@@ -203,12 +198,12 @@ def _streamk_mac_range(
     for i in gl.static_range(NUM_BUFFERS - 2):
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
         next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
-            layout=dot_a_layout
+            layout=OPERAND_LAYOUT_A
         )
         next_b = (
             tdm_smem_b.index((num_computes + 1) % NUM_BUFFERS)
             .permute((1, 0))
-            .load(layout=dot_b_layout)
+            .load(layout=OPERAND_LAYOUT_B)
         )
         a_scale, b_scale = _load_ab_scale(
             a_scale_ptr,
@@ -303,13 +298,13 @@ def _atomic_add_tile(
     stride_cn,
     BLOCK_SIZE_M: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
-    wmma_layout: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
 ):
     offs_cm = pid_m * BLOCK_SIZE_M + gl.arange(
-        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, wmma_layout)
+        0, BLOCK_SIZE_M, layout=gl.SliceLayout(1, WMMA_LAYOUT)
     )
     offs_cn = pid_n * BLOCK_SIZE_N + gl.arange(
-        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, wmma_layout)
+        0, BLOCK_SIZE_N, layout=gl.SliceLayout(0, WMMA_LAYOUT)
     )
     offs = offs_cm[:, None] * stride_cm + offs_cn[None, :] * stride_cn
     mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
@@ -389,6 +384,13 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
     )
     tdm_shared_b: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
         [[BLOCK_SIZE_K, 8]], [BLOCK_SIZE_N, BLOCK_SIZE_K], [1, 0]
+    )
+    
+    dot_a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=wmma_layout, k_width=8
+    )
+    dot_b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=wmma_layout, k_width=8
     )
     
     # Fast path: when a single scale group spans the whole tile in both N and K,
@@ -474,6 +476,8 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             BLOCK_SIZE_N,
             BLOCK_SIZE_K,
             wmma_layout,
+            dot_a_layout,
+            dot_b_layout,
             warp_bases,
             SCALAR_B_SCALE,
             cache_modifier,
@@ -534,6 +538,8 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             BLOCK_SIZE_N,
             BLOCK_SIZE_K,
             wmma_layout,
+            dot_a_layout,
+            dot_b_layout,
             warp_bases,
             SCALAR_B_SCALE,
             cache_modifier,
