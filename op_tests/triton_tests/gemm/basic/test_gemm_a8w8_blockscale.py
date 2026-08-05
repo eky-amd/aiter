@@ -163,8 +163,16 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle, streamk):
         if shuffle:
             if DEVICE_ARCH not in ("gfx1250"):
                 pytest.skip("Gluon + shuffle implementation requires gfx1250.")
+        if streamk != "none":
+            if DEVICE_ARCH not in ("gfx1250"):
+                pytest.skip("Gluon + streamk implementation requires gfx1250.")
+            if shuffle:
+                pytest.skip("Gluon streamk + shuffle implementation does not exist.")
         elif DEVICE_ARCH not in ("gfx950", "gfx1250"):
             pytest.skip("Gluon implementation requires gfx950 or gfx1250.")
+    elif backend == "triton":
+        if streamk != "none":
+            pytest.skip("Triton streamk implementation does not exist.")
 
     if shuffle and (N % 16 > 0 or K % 32 > 0):
         pytest.skip(
@@ -208,18 +216,18 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle, streamk):
             
         elif streamk == "pure":
         
-                    def impl(x, w, xs, ws, dt, y):
-                        return gemm_a8w8_streamk_pure(x, w, xs, ws, dt, y, backend=backend)
+            def impl(x, w, xs, ws, dt, y):
+                return gemm_a8w8_streamk_pure(x, w, xs, ws, dt, y, backend=backend)
                     
         elif streamk == "dp_1tile":
         
-                    def impl(x, w, xs, ws, dt, y):
-                        return gemm_a8w8_streamk_dp_1tile(x, w, xs, ws, dt, y, backend=backend)
+            def impl(x, w, xs, ws, dt, y):
+                return gemm_a8w8_streamk_dp_1tile(x, w, xs, ws, dt, y, backend=backend)
                     
         elif streamk == "dp_2tile":
         
-                    def impl(x, w, xs, ws, dt, y):
-                        return gemm_a8w8_streamk_dp_2tile(x, w, xs, ws, dt, y, backend=backend)
+            def impl(x, w, xs, ws, dt, y):
+                return gemm_a8w8_streamk_dp_2tile(x, w, xs, ws, dt, y, backend=backend)
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
