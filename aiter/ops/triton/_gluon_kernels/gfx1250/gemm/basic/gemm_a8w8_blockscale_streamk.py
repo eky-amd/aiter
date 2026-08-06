@@ -28,52 +28,16 @@ _gemm_a8w8_streamk_bandwidth_bound_repr = make_kernel_repr(
 )
 
 
-# ---------------------------------------------------------------------------
-# MAC loop: reduce a contiguous K-tile range [local_iter, local_iter_end) of one output tile.
-# ---------------------------------------------------------------------------
-@gluon.jit
-def _load_ab_scale(
-    a_scale_ptr,
-    b_scale_ptr,
-    offs_a_scale,
-    offs_b_scale,
-    b_scale_scalar_off,
-    local_iter,
-    k_idx,
-    iter_count,
-    stride_ascale_k,
-    stride_bscale_k,
-    SCALAR_B_SCALE: gl.constexpr,
-    cache_modifier: gl.constexpr,
-):
-    k = local_iter + gl.minimum(k_idx, iter_count - 1)
-    a_scale = gl.amd.cdna4.buffer_load(
-        ptr=a_scale_ptr + k * stride_ascale_k,
-        offsets=offs_a_scale,
-        cache=cache_modifier,
-    )
-    if SCALAR_B_SCALE:
-        b_scale = gl.load(
-            b_scale_ptr + k * stride_bscale_k + b_scale_scalar_off,
-            cache_modifier=cache_modifier,
-        )
-    else:
-        b_scale = gl.amd.cdna4.buffer_load(
-            ptr=b_scale_ptr + k * stride_bscale_k,
-            offsets=offs_b_scale,
-            cache=cache_modifier,
-        )
-    return a_scale, b_scale
-
-
 @gluon.jit
 def _streamk_mac_range(
     a_desc_base,
     b_desc_base,
     tdm_smem_a,
     tdm_smem_b,
-    a_scale_ptr,
-    b_scale_ptr,
+    a_scale_ptr_base,
+    b_scale_ptr_base,
+    smem_a_scale,
+    smem_b_scale,
     stride_ascale_m,
     stride_ascale_k,
     stride_bscale_k,
@@ -85,6 +49,7 @@ def _streamk_mac_range(
     pid_n,
     local_iter,
     local_iter_end,
+    GROUP_K: gl.constexpr,
     GROUP_N: gl.constexpr,
     BLOCK_SIZE_M: gl.constexpr,
     BLOCK_SIZE_N: gl.constexpr,
@@ -137,8 +102,30 @@ def _streamk_mac_range(
     else:
         a_desc = a_desc_base
         b_desc = b_desc_base
+        
+    k_idx = (local_iter * BLOCK_SIZE_K) // GROUP_K
+    a_scale_ptr = a_scale_ptr_base + k_idx * stride_ascale_k
+    b_scale_ptr = b_scale_ptr_base + k_idx * stride_bscale_k
 
     # -------------------- Prologue: issue NUM_BUFFERS - 1 loads --------------
+    # load scales
+    a_scale = gl.amd.cdna4.buffer_load(
+        ptr=a_scale_ptr,
+        offsets=offs_a_scale,
+        cache=cache_modifier,
+    )
+    if SCALAR_B_SCALE:
+        b_scale = gl.load(
+            b_scale_ptr + b_scale_scalar_off,
+            cache_modifier=cache_modifier,
+        )
+    else:
+        b_scale = gl.amd.cdna4.buffer_load(
+            ptr=b_scale_ptr,
+            offsets=offs_b_scale,
+            cache=cache_modifier,
+        )
+        
     for _ in gl.static_range(NUM_BUFFERS - 1):
         if USE_DESC_STEP:
             gl.amd.gfx1250.tdm.async_load(
@@ -176,29 +163,26 @@ def _streamk_mac_range(
         .permute((1, 0))
         .load(layout=OPERAND_LAYOUT_B)
     )
+    
+    # store scales
+    smem_a_scale.store(a_scale)
+    if not SCALAR_B_SCALE:
+        smem_b_scale.store(b_scale)
+    # Scalar case carries b_scale in a register (folded into the a-scale below).
+    cur_b_scale = b_scale
 
     # -------------------- Main loop -----------------------------------------
     for _ in range(iter_count - (NUM_BUFFERS - 1)):
-        # NOTE: a_scale and b_scale are globally buffer-loaded instead of from smem for each loop iteration
-        a_scale, b_scale = _load_ab_scale(
-            a_scale_ptr,
-            b_scale_ptr,
-            offs_a_scale,
-            offs_b_scale,
-            b_scale_scalar_off,
-            local_iter,
-            num_computes,
-            iter_count,
-            stride_ascale_k,
-            stride_bscale_k,
-            SCALAR_B_SCALE,
-            cache_modifier,
-        )
+        # Loading a scale and curr A scale
+        cur_a_scale = smem_a_scale.load(layout=gl.SliceLayout(1, WMMA_LAYOUT))
+        if not SCALAR_B_SCALE:
+            cur_b_scale = smem_b_scale.load(layout=gl.SliceLayout(0, WMMA_LAYOUT))
+            
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         if SCALAR_B_SCALE:
-            acc += res * a_scale[:, None] * b_scale
+            acc += res * cur_a_scale[:, None] * cur_b_scale
         else:
-            acc += res * a_scale[:, None] * b_scale[None, :]
+            acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
         if USE_DESC_STEP:
             gl.amd.gfx1250.tdm.async_load(
@@ -238,9 +222,35 @@ def _streamk_mac_range(
             .permute((1, 0))
             .load(layout=OPERAND_LAYOUT_B)
         )
+        
+        # scales -- ptrs, load from global
+        a_scale_ptr += stride_ascale_k
+        b_scale_ptr += stride_bscale_k
+        a_scale = gl.amd.cdna4.buffer_load(
+            ptr=a_scale_ptr,
+            offsets=offs_a_scale,
+            cache=cache_modifier,
+        )
+        if SCALAR_B_SCALE:
+            b_scale = gl.load(
+                b_scale_ptr + b_scale_scalar_off, cache_modifier=cache_modifier
+            )
+        else:
+            b_scale = gl.amd.cdna4.buffer_load(
+                ptr=b_scale_ptr, offsets=offs_b_scale, cache=cache_modifier
+            )
+        smem_a_scale.store(a_scale)
+        if not SCALAR_B_SCALE:
+            smem_b_scale.store(b_scale)
+        cur_b_scale = b_scale
+                
         num_computes += 1
 
     # -------------------- Epilogue: drain the pipeline ----------------------
+    cur_a_scale = smem_a_scale.load(layout=gl.SliceLayout(1, WMMA_LAYOUT))
+    if not SCALAR_B_SCALE:
+        cur_b_scale = smem_b_scale.load(layout=gl.SliceLayout(0, WMMA_LAYOUT))
+            
     for i in gl.static_range(NUM_BUFFERS - 2):
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 3 - i) * 2)
         next_a = tdm_smem_a.index((num_computes + 1) % NUM_BUFFERS).load(
@@ -251,51 +261,28 @@ def _streamk_mac_range(
             .permute((1, 0))
             .load(layout=OPERAND_LAYOUT_B)
         )
-        a_scale, b_scale = _load_ab_scale(
-            a_scale_ptr,
-            b_scale_ptr,
-            offs_a_scale,
-            offs_b_scale,
-            b_scale_scalar_off,
-            local_iter,
-            num_computes,
-            iter_count,
-            stride_ascale_k,
-            stride_bscale_k,
-            SCALAR_B_SCALE,
-            cache_modifier,
-        )
+
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
         valid = (num_computes < iter_count).to(gl.float32)
         if SCALAR_B_SCALE:
-            acc += res * a_scale[:, None] * b_scale * valid
+            acc += res * cur_a_scale[:, None] * cur_b_scale * valid
         else:
-            acc += res * a_scale[:, None] * b_scale[None, :] * valid
+            acc += res * cur_a_scale[:, None] * cur_b_scale[None, :] * valid
         cur_a = next_a
         cur_b = next_b
         num_computes += 1
+        
+        cur_a_scale = smem_a_scale.load(layout=gl.SliceLayout(1, WMMA_LAYOUT))
+        if not SCALAR_B_SCALE:
+            cur_b_scale = smem_b_scale.load(layout=gl.SliceLayout(0, WMMA_LAYOUT))
 
     # -------------------- Final tile ----------------------------------------
-    a_scale, b_scale = _load_ab_scale(
-        a_scale_ptr,
-        b_scale_ptr,
-        offs_a_scale,
-        offs_b_scale,
-        b_scale_scalar_off,
-        local_iter,
-        num_computes,
-        iter_count,
-        stride_ascale_k,
-        stride_bscale_k,
-        SCALAR_B_SCALE,
-        cache_modifier,
-    )
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
     valid = (num_computes < iter_count).to(gl.float32)
     if SCALAR_B_SCALE:
-        acc += res * a_scale[:, None] * b_scale * valid
+        acc += res * cur_a_scale[:, None] * cur_b_scale * valid
     else:
-        acc += res * a_scale[:, None] * b_scale[None, :] * valid
+        acc += res * cur_a_scale[:, None] * cur_b_scale[None, :] * valid
 
     return acc
 
@@ -432,11 +419,25 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
         [[BLOCK_SIZE_K, 8]], [BLOCK_SIZE_N, BLOCK_SIZE_K], [1, 0]
     )
 
+    shared_a_scale: gl.constexpr = gl.SwizzledSharedLayout(
+            vec=16, per_phase=2, max_phase=8, order=[0]
+    )
+    shared_b_scale: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=16, per_phase=2, max_phase=8, order=[0]
+    )
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=wmma_layout, k_width=8
     )
     dot_b_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=wmma_layout, k_width=8
+    )
+    
+    smem_a_scale = gl.allocate_shared_memory(
+        gl.float32, [BLOCK_SIZE_M], layout=shared_a_scale
+    )
+
+    smem_b_scale = gl.allocate_shared_memory(
+        gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
     )
 
     # Fast path: when a single scale group spans the whole tile in both N and K,
@@ -514,6 +515,7 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
     while tile_id < dp_tiles:
         pid_m = tile_id // num_pid_n
         pid_n = tile_id % num_pid_n
+        
         acc = _streamk_mac_range(
             a_desc_base,
             b_desc_base,
@@ -521,6 +523,8 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             tdm_smem_b,
             a_scale_ptr,
             b_scale_ptr,
+            smem_a_scale,
+            smem_b_scale,
             stride_ascale_m,
             stride_ascale_k,
             stride_bscale_k,
@@ -532,6 +536,7 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             pid_n,
             0,
             iters_per_tile,
+            GROUP_K,
             GROUP_N,
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
@@ -585,6 +590,8 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             tdm_smem_b,
             a_scale_ptr,
             b_scale_ptr,
+            smem_a_scale,
+            smem_b_scale,
             stride_ascale_m,
             stride_ascale_k,
             stride_bscale_k,
@@ -596,6 +603,7 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             pid_n,
             local_iter,
             local_iter_end,
+            GROUP_K,
             GROUP_N,
             BLOCK_SIZE_M,
             BLOCK_SIZE_N,
