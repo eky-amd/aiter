@@ -49,6 +49,7 @@ def _streamk_mac_range(
     pid_n,
     local_iter,
     local_iter_end,
+    acc_dtype,
     GROUP_K: gl.constexpr,
     GROUP_N: gl.constexpr,
     BLOCK_SIZE_M: gl.constexpr,
@@ -61,10 +62,9 @@ def _streamk_mac_range(
     SCALAR_B_SCALE: gl.constexpr,
     cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
-    USE_DESC_STEP: gl.constexpr,
 ):
-    acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=WMMA_LAYOUT)
-    zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=gl.float32, layout=WMMA_LAYOUT)
+    acc = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=WMMA_LAYOUT)
+    zeros = gl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=acc_dtype, layout=WMMA_LAYOUT)
 
     offs_am = (
         pid_m * BLOCK_SIZE_M
@@ -86,22 +86,18 @@ def _streamk_mac_range(
     num_loads = 0
     num_computes = 0
 
-    if USE_DESC_STEP:
-        k_seg_offset = local_iter * BLOCK_SIZE_K
-        K_seg = gl.minimum(local_iter_end * BLOCK_SIZE_K, K) - k_seg_offset
-        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            a_desc_base,
-            add_offsets=[off_am_tdm, k_seg_offset],
-            set_bounds=[M - off_am_tdm, K_seg],
-        )
-        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-            b_desc_base,
-            add_offsets=[off_bn_tdm, k_seg_offset],
-            set_bounds=[N - off_bn_tdm, K_seg],
-        )
-    else:
-        a_desc = a_desc_base
-        b_desc = b_desc_base
+    k_seg_offset = local_iter * BLOCK_SIZE_K
+    K_seg = gl.minimum(local_iter_end * BLOCK_SIZE_K, K) - k_seg_offset
+    a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        a_desc_base,
+        add_offsets=[off_am_tdm, k_seg_offset],
+        set_bounds=[M - off_am_tdm, K_seg],
+    )
+    b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+        b_desc_base,
+        add_offsets=[off_bn_tdm, k_seg_offset],
+        set_bounds=[N - off_bn_tdm, K_seg],
+    )
         
     k_idx = (local_iter * BLOCK_SIZE_K) // GROUP_K
     a_scale_ptr = a_scale_ptr_base + k_idx * stride_ascale_k
@@ -127,32 +123,18 @@ def _streamk_mac_range(
         )
         
     for _ in gl.static_range(NUM_BUFFERS - 1):
-        if USE_DESC_STEP:
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [0, 0], tdm_smem_a.index(num_loads % NUM_BUFFERS)
-            )
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS)
-            )
-            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                a_desc, add_offsets=[0, BLOCK_SIZE_K], clamp_bounds=True
-            )
-            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                b_desc, add_offsets=[0, BLOCK_SIZE_K], clamp_bounds=True
-            )
-        else:
-            # NOTE: If the number of loads extends past the iter_count, then we just reload the last "valid" K block as dummy values
-            load_idx = local_iter + gl.minimum(num_loads, iter_count - 1)
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc,
-                [off_am_tdm, load_idx * BLOCK_SIZE_K],
-                tdm_smem_a.index(num_loads % NUM_BUFFERS),
-            )
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc,
-                [off_bn_tdm, load_idx * BLOCK_SIZE_K],
-                tdm_smem_b.index(num_loads % NUM_BUFFERS),
-            )
+        gl.amd.gfx1250.tdm.async_load(
+            a_desc, [0, 0], tdm_smem_a.index(num_loads % NUM_BUFFERS)
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS)
+        )
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[0, BLOCK_SIZE_K], clamp_bounds=True
+        )
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[0, BLOCK_SIZE_K], clamp_bounds=True
+        )
         num_loads += 1
 
     gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
@@ -184,33 +166,18 @@ def _streamk_mac_range(
         else:
             acc += res * cur_a_scale[:, None] * cur_b_scale[None, :]
 
-        if USE_DESC_STEP:
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc, [0, 0], tdm_smem_a.index(num_loads % NUM_BUFFERS), pred=1
-            )
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS), pred=1
-            )
-            a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                a_desc, add_offsets=[0, BLOCK_SIZE_K], clamp_bounds=True
-            )
-            b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
-                b_desc, add_offsets=[0, BLOCK_SIZE_K], clamp_bounds=True
-            )
-        else:
-            load_idx = local_iter + gl.minimum(num_loads, iter_count - 1)
-            gl.amd.gfx1250.tdm.async_load(
-                a_desc,
-                [off_am_tdm, load_idx * BLOCK_SIZE_K],
-                tdm_smem_a.index(num_loads % NUM_BUFFERS),
-                pred=1,
-            )
-            gl.amd.gfx1250.tdm.async_load(
-                b_desc,
-                [off_bn_tdm, load_idx * BLOCK_SIZE_K],
-                tdm_smem_b.index(num_loads % NUM_BUFFERS),
-                pred=1,
-            )
+        gl.amd.gfx1250.tdm.async_load(
+            a_desc, [0, 0], tdm_smem_a.index(num_loads % NUM_BUFFERS), pred=1
+        )
+        gl.amd.gfx1250.tdm.async_load(
+            b_desc, [0, 0], tdm_smem_b.index(num_loads % NUM_BUFFERS), pred=1
+        )
+        a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            a_desc, add_offsets=[0, BLOCK_SIZE_K], clamp_bounds=True
+        )
+        b_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(
+            b_desc, add_offsets=[0, BLOCK_SIZE_K], clamp_bounds=True
+        )
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
         num_loads += 1
 
@@ -263,7 +230,7 @@ def _streamk_mac_range(
         )
 
         res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
-        valid = (num_computes < iter_count).to(gl.float32)
+        valid = (num_computes < iter_count).to(acc_dtype)
         if SCALAR_B_SCALE:
             acc += res * cur_a_scale[:, None] * cur_b_scale * valid
         else:
@@ -278,7 +245,7 @@ def _streamk_mac_range(
 
     # -------------------- Final tile ----------------------------------------
     res = gl.amd.gfx1250.wmma(cur_a, cur_b, zeros)
-    valid = (num_computes < iter_count).to(gl.float32)
+    valid = (num_computes < iter_count).to(acc_dtype)
     if SCALAR_B_SCALE:
         acc += res * cur_a_scale[:, None] * cur_b_scale * valid
     else:
@@ -432,12 +399,14 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
         operand_index=1, parent=wmma_layout, k_width=8
     )
     
+    acc_dtype = gl.float32 if c_ptr.type.element_ty != gl.int8 else gl.int32
+    
     smem_a_scale = gl.allocate_shared_memory(
-        gl.float32, [BLOCK_SIZE_M], layout=shared_a_scale
+        acc_dtype, [BLOCK_SIZE_M], layout=shared_a_scale
     )
 
     smem_b_scale = gl.allocate_shared_memory(
-        gl.float32, [BLOCK_SIZE_N], layout=shared_b_scale
+        acc_dtype, [BLOCK_SIZE_N], layout=shared_b_scale
     )
 
     # Fast path: when a single scale group spans the whole tile in both N and K,
@@ -447,10 +416,6 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
     SCALAR_B_SCALE: gl.constexpr = (GROUP_N >= BLOCK_SIZE_N) and (
         GROUP_K >= BLOCK_SIZE_K
     )
-
-    # Descriptor stepping (update_tensor_descriptor + fixed [0,0] async_load) vs
-    # absolute [row, k*BK] offsets. Toggle for testing.
-    USE_DESC_STEP: gl.constexpr = True
 
     # Whole-tensor A/B descriptors, built once. These are *templates*: a
     # descriptor is an immutable SSA value, and update_tensor_descriptor returns
@@ -536,6 +501,7 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             pid_n,
             0,
             iters_per_tile,
+            acc_dtype,
             GROUP_K,
             GROUP_N,
             BLOCK_SIZE_M,
@@ -548,7 +514,6 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             SCALAR_B_SCALE,
             cache_modifier,
             NUM_BUFFERS,
-            USE_DESC_STEP,
         )
         _store_tile(
             acc,
@@ -603,6 +568,7 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             pid_n,
             local_iter,
             local_iter_end,
+            acc_dtype,
             GROUP_K,
             GROUP_N,
             BLOCK_SIZE_M,
@@ -615,41 +581,27 @@ def _gemm_a8w8_streamk_bandwidth_bound_kernel(
             SCALAR_B_SCALE,
             cache_modifier,
             NUM_BUFFERS,
-            USE_DESC_STEP,
         )
+        
+        # Algorithm as described by the paper (implementation simplified by atomics):
+        # if local_iter != 0:
+        #     store partials and flags
+        # else:
+        #     load partials from other SMs/CUs, add to acc, and store in c
 
-        # NOTE: Equivalent to tile_started && tile_ended (i.e. iter == tile_iter && iter_end >= tile_iter_end)
-        if (local_iter == 0) and (local_iter_end == iters_per_tile):
-            # Solely-owned tile -> final result, write straight to y.
-            _store_tile(
-                acc,
-                c_ptr,
-                tdm_shared_c,
-                tdm_smem_c,
-                pid_m,
-                pid_n,
-                M,
-                N,
-                stride_cm,
-                stride_cn,
-                BLOCK_SIZE_M,
-                BLOCK_SIZE_N,
-            )
-        else:
-            # Partial K-range of a split tile means atomically add into y.
-            _atomic_add_tile(
-                acc,
-                c_ptr,
-                pid_m,
-                pid_n,
-                M,
-                N,
-                stride_cm,
-                stride_cn,
-                BLOCK_SIZE_M,
-                BLOCK_SIZE_N,
-                wmma_layout,
-            )
+        _atomic_add_tile(
+            acc,
+            c_ptr,
+            pid_m,
+            pid_n,
+            M,
+            N,
+            stride_cm,
+            stride_cn,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            wmma_layout,
+        )
 
         iter = tile_iter_end
 

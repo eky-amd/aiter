@@ -197,13 +197,9 @@ def _gemm_a8w8_streamk_impl(
     sk_tiles = _streamk_sk_tiles(variant, total_tiles, num_sms)
 
     if y is None:
-        y = torch.empty((M, N), dtype=dtype, device=x.device)
-
-    y_acc = (
-        torch.zeros((M, N), dtype=torch.float32, device=x.device)
-        if sk_tiles > 0
-        else y
-    )
+        y = torch.zeros((M, N), dtype=dtype, device=x.device)
+    else:
+        y.zero_()
 
     # WMMA warp layout bases, matching the block-scale gfx1250 convention.
     warp_bases = [(0, 1)]
@@ -215,7 +211,7 @@ def _gemm_a8w8_streamk_impl(
     _KERNEL_MAP[kernel_type][grid](
         x,
         w,
-        y_acc,
+        y,
         x_scale,
         w_scale,
         M,
@@ -225,8 +221,8 @@ def _gemm_a8w8_streamk_impl(
         x.stride(1),
         w.stride(0),
         w.stride(1),
-        y_acc.stride(0),
-        y_acc.stride(1),
+        y.stride(0),
+        y.stride(1),
         x_scale.stride(0),
         x_scale.stride(1),
         w_scale.stride(0),
@@ -239,9 +235,6 @@ def _gemm_a8w8_streamk_impl(
         warp_bases=warp_bases,
         **config,
     )
-
-    if y_acc is not y:
-        y.copy_(y_acc)
 
     return y
 
