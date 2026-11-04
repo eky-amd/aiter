@@ -153,6 +153,8 @@ def paged_attn_decode(
     compute_type,
     output_type,
     backend="triton",
+    use_max_context_length=True,
+    context_partition_size=256,
 ):
     (
         query,
@@ -187,7 +189,9 @@ def paged_attn_decode(
         context_lens = context_lens.to(torch.int32)
         scale = torch.ones(1, dtype=torch.float32, device="cuda")
         num_splits = get_recommended_splits(
-            BS, H_KV, max_context_length=max_context_len
+            BS,
+            H_KV,
+            max_context_length=max_context_len if use_max_context_length else None,
         )
         return lambda: pa_decode_gluon(
             output=triton_output,
@@ -199,6 +203,7 @@ def paged_attn_decode(
             softmax_scale=attn_scale,
             query_length=1,
             max_context_partition_num=num_splits,
+            context_partition_size=context_partition_size,
             compute_type=compute_type,
             key_scale=scale,
             value_scale=scale,
@@ -283,6 +288,8 @@ def run_benchmark(args):
             compute_type,
             output_type,
             args.backend,
+            not args.no_max_context_length,
+            args.context_partition_size,
         )
 
         fn()
@@ -336,6 +343,17 @@ def parse_args():
         type=int,
         default=0,
         help="Physical KV pages. 0 = one page per sequence block slot (capped at 4 GB per cache tensor).",
+    )
+    parser.add_argument(
+        "-no_max_context_length",
+        action="store_true",
+        help="Gluon: pick the split count without the context length, as CUDA-graph callers do.",
+    )
+    parser.add_argument(
+        "-context_partition_size",
+        type=int,
+        default=256,
+        help="Gluon: tokens per context partition.",
     )
     parser.add_argument("-dtype", default="fp16")
     parser.add_argument("-kv_cache_dtype", default="fp16")

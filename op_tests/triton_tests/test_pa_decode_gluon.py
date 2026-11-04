@@ -1210,7 +1210,10 @@ def test_head_192_full_context_regression(context_length, ps):
 @pytest.mark.parametrize(
     "num_seqs, num_kv_heads, kwargs, expected",
     [
-        (1, 8, {}, 8),
+        (1, 8, {}, 16),
+        (4, 4, {}, 16),
+        (8, 4, {}, 8),
+        (1, 8, {"query_length": 4}, 8),
         (1, 8, {"max_context_length": 32768}, 32),
         (1, 8, {"max_context_length": 12000}, 32),
         (1, 2, {"max_context_length": 4096}, 16),
@@ -1233,16 +1236,21 @@ def test_get_recommended_splits(monkeypatch, num_seqs, num_kv_heads, kwargs, exp
 
 
 @pytest.mark.parametrize(
-    "kv_heads, lengths",
+    "kv_heads, lengths, partition_size, with_max_context_length",
     [
-        (8, [8192]),
-        (8, [12000]),
-        (8, [32768]),
-        (4, [32768, 300]),
-        (2, [32768, 1000]),
+        (8, [8192], 256, True),
+        (8, [12000], 256, True),
+        (8, [32768], 256, True),
+        (4, [32768, 300], 256, True),
+        (2, [32768, 1000], 256, True),
+        # One-wave grids without a context length: 16 splits with partition-aligned split ranges.
+        (4, [1056, 100, 1500, 2047], 128, False),
+        (2, [300, 4000], 128, False),
     ],
 )
-def test_ps_recommended_splits_match_reference(kv_heads, lengths):
+def test_ps_recommended_splits_match_reference(
+    kv_heads, lengths, partition_size, with_max_context_length
+):
     """Check ps=True with the recommended split count against an FP32 reference."""
     torch.manual_seed(0)
     group, head_size, page, x = 8, 64, 16, 8
@@ -1262,7 +1270,11 @@ def test_ps_recommended_splits_match_reference(kv_heads, lengths):
         first_page += n
     scale = head_size**-0.5
 
-    splits = get_recommended_splits(batch, kv_heads, max_context_length=max(lengths))
+    splits = get_recommended_splits(
+        batch,
+        kv_heads,
+        max_context_length=max(lengths) if with_max_context_length else None,
+    )
     shape = (batch, kv_heads, splits, group)
     exp_sums = torch.empty(shape, dtype=torch.float32, device="cuda")
     max_logits = torch.empty_like(exp_sums)
@@ -1278,7 +1290,7 @@ def test_ps_recommended_splits_match_reference(kv_heads, lengths):
         softmax_scale=scale,
         query_length=1,
         max_context_partition_num=splits,
-        context_partition_size=256,
+        context_partition_size=partition_size,
         compute_type=query.dtype,
         exp_sums=exp_sums,
         max_logits=max_logits,

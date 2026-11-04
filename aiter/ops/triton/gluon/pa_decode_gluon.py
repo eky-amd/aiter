@@ -89,6 +89,9 @@ def get_occupancy():
     return 2
 
 
+_SMALL_GRID_SPLITS = 16
+
+
 def get_recommended_splits(
     num_sequences,
     num_kv_heads,
@@ -102,13 +105,16 @@ def get_recommended_splits(
     programs = num_sequences * num_kv_heads * split_kv_blocks
     max_context_partition_num = triton.cdiv(num_sm, programs) * split_kv_blocks
     legacy = min(max_context_partition_num, 8)
-    # Small grids leave CUs idle; ps=True with query_length > 1 is inexact when split.
-    if (
-        max_context_length is None
-        or query_length != 1
-        or split_kv_blocks != 1
-        or programs * 32 > num_sm
-    ):
+    # ps=True with query_length > 1 is inexact when split.
+    if query_length != 1 or split_kv_blocks != 1:
+        return legacy
+    if max_context_length is None:
+        # No context length (e.g. CUDA graphs): fill a one-wave grid; the kernel aligns the splits.
+        if programs * _SMALL_GRID_SPLITS <= props.multi_processor_count:
+            return max(legacy, _SMALL_GRID_SPLITS)
+        return legacy
+    # Small grids leave CUs idle.
+    if programs * 32 > num_sm:
         return legacy
     context_tiles = triton.cdiv(max_context_length, 256)
     # The C++ ps reduce is wrong above 32 partitions (cross-half ds_swizzle).
@@ -2322,6 +2328,7 @@ def paged_attention_decode_sliding_window(
     ONE_SHOT: gl.constexpr = False,
     KEY_HEAD_PADDED: gl.constexpr = False,
     VALUE_HEAD_PADDED: gl.constexpr = False,
+    ALIGN_SPLITS: gl.constexpr = False,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -2665,6 +2672,11 @@ def paged_attention_decode_sliding_window(
         page_size = gl.cdiv(
             context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
         )
+        if ALIGN_SPLITS and CONTEXT_PARTITION_SIZE_PER_BLOCK == 1:
+            # Start every split on a partition boundary so no partition is walked by two splits.
+            page_size = (
+                gl.cdiv(page_size, CONTEXT_PARTITION_SIZE) * CONTEXT_PARTITION_SIZE
+            )
         sequence_start_idx = page_size * sequence_split_idx
 
         sequence_end_idx = gl.minimum(
@@ -4523,7 +4535,14 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             grid = (num_sequences, mtp_splits, num_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
-            head_size_kwargs = {}
+            # One workgroup per CU: align the split ranges to partitions.
+            head_size_kwargs = {
+                "ALIGN_SPLITS": num_splits > 1
+                and num_sequences * num_kv_heads * num_splits
+                <= torch.cuda.get_device_properties(
+                    query_ptr.device
+                ).multi_processor_count
+            }
         paged_attention_kernel[grid](
             exp_sums_ptr,
             max_logits_ptr,
