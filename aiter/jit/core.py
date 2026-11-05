@@ -972,6 +972,7 @@ def validate_and_update_archs():
         "gfx1201",
         "gfx1250",
         "gfx1250-strict",
+        "gfx1310",
         "gfx950",
     ]
 

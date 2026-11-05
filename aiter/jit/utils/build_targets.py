@@ -28,6 +28,7 @@ GFX_MAP = {
     17: "gfx1201",
     18: "gfx1250",
     19: "gfx1250-strict",
+    20: "gfx1310",
 }
 
 # CU counts an explicit GPU_ARCHS build targets for each supported gfx arch, full
